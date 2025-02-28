@@ -91,9 +91,19 @@ public:
 
   // Creates a pointer descriptor from this component description, possibly
   // with subscripts
+  RT_API_ATTRS void CreatePointerDescriptor(Descriptor &descriptor,
+      const Descriptor &container, Terminator &terminator,
+      const SubscriptValue *subscripts = nullptr) const {
+    if (subscripts) {
+      CreatePointerDescriptor(descriptor, container, terminator,
+          container.SubscriptsToByteOffset(subscripts));
+    } else {
+      CreatePointerDescriptor(
+          descriptor, container, terminator, static_cast<std::size_t>(0));
+    }
+  }
   RT_API_ATTRS void CreatePointerDescriptor(Descriptor &,
-      const Descriptor &container, Terminator &,
-      const SubscriptValue * = nullptr) const;
+      const Descriptor &container, Terminator &, const std::size_t) const;
 
   FILE *Dump(FILE * = stdout) const;
 

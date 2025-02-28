@@ -228,6 +228,116 @@ static RT_API_ATTRS void BlankPadCharacterAssignment(Descriptor &to,
   }
 }
 
+static inline RT_API_ATTRS void ComponentsAssignment(Descriptor &to,
+    const Descriptor &from, std::size_t toAt, std::size_t fromAt,
+    const typeInfo::DerivedType *updatedToDerived, Terminator &terminator,
+    int flags, MemmoveFct memmoveFct) {
+  // Copy the data components (incl. the parent) first.
+  const Descriptor &componentDesc{updatedToDerived->component()};
+  auto numComponents{
+      static_cast<size_t>(componentDesc.GetDimension(0).Extent())};
+  auto *toElem{to.OffsetElement<char>(toAt)};
+  const auto *fromElem{from.OffsetElement<const char>(fromAt)};
+  for (std::size_t k{0}; k < numComponents; ++k) {
+    const auto &comp{*componentDesc.OffsetElement<typeInfo::Component>(k *
+        componentDesc.GetDimension(0)
+            .ByteStride())}; // TODO: exploit contiguity here
+    // Use PolymorphicLHS for components so that the right things happen
+    // when the components are polymorphic; when they're not, they're both
+    // not, and their declared types will match.
+    int nestedFlags{MaybeReallocate | PolymorphicLHS};
+    if (flags & ComponentCanBeDefinedAssignment) {
+      nestedFlags |= CanBeDefinedAssignment | ComponentCanBeDefinedAssignment;
+    }
+    switch (comp.genre()) {
+    case typeInfo::Component::Genre::Data:
+      if (comp.category() == TypeCategory::Derived) {
+        StaticDescriptor<maxRank, true, 10 /*?*/> statDesc[2];
+        Descriptor &toCompDesc{statDesc[0].descriptor()};
+        Descriptor &fromCompDesc{statDesc[1].descriptor()};
+        comp.CreatePointerDescriptor(toCompDesc, to, terminator, toAt);
+        comp.CreatePointerDescriptor(fromCompDesc, from, terminator, fromAt);
+        Assign(toCompDesc, fromCompDesc, terminator, nestedFlags);
+      } else { // Component has intrinsic type; simply copy raw bytes
+        std::size_t componentByteSize{comp.SizeInBytes(to)};
+        memmoveFct(toElem + comp.offset(), fromElem + comp.offset(),
+            componentByteSize);
+      }
+      break;
+    case typeInfo::Component::Genre::Pointer: {
+      std::size_t componentByteSize{comp.SizeInBytes(to)};
+      memmoveFct(
+          toElem + comp.offset(), fromElem + comp.offset(), componentByteSize);
+    } break;
+    case typeInfo::Component::Genre::Allocatable:
+    case typeInfo::Component::Genre::Automatic: {
+      auto *toDesc{reinterpret_cast<Descriptor *>(toElem + comp.offset())};
+      const auto *fromDesc{reinterpret_cast<const Descriptor *>(
+          from.OffsetElement<char>(fromAt) + comp.offset())};
+      // Allocatable components of the LHS are unconditionally
+      // deallocated before assignment (F'2018 10.2.1.3(13)(1)),
+      // unlike a "top-level" assignment to a variable, where
+      // deallocation is optional.
+      //
+      // Be careful not to destroy/reallocate the LHS, if there is
+      // overlap between LHS and RHS (it seems that partial overlap
+      // is not possible, though).
+      // Invoke Assign() recursively to deal with potential aliasing.
+      if (toDesc->IsAllocatable()) {
+        if (!fromDesc->IsAllocated()) {
+          // No aliasing.
+          //
+          // If to is not allocated, the Destroy() call is a no-op.
+          // This is just a shortcut, because the recursive Assign()
+          // below would initiate the destruction for to.
+          // No finalization is required.
+          toDesc->Destroy(
+              /*finalize=*/false, /*destroyPointers=*/false, &terminator);
+          continue; // F'2018 10.2.1.3(13)(2)
+        }
+      }
+      // Force LHS deallocation with DeallocateLHS flag.
+      // The actual deallocation may be avoided, if the existing
+      // location can be reoccupied.
+      Assign(*toDesc, *fromDesc, terminator, nestedFlags | DeallocateLHS);
+    } break;
+    }
+  }
+
+  // Copy procedure pointer components
+  const Descriptor &procPtrDesc{updatedToDerived->procPtr()};
+  const auto numProcPtrs{
+      static_cast<size_t>(procPtrDesc.GetDimension(0).Extent())};
+  for (std::size_t k{0}; k < numProcPtrs; ++k) {
+    const auto &procPtr{*procPtrDesc.OffsetElement<typeInfo::ProcPtrComponent>(
+        k * procPtrDesc.GetDimension(0).ByteStride())};
+    memmoveFct(toElem + procPtr.offset, fromElem + procPtr.offset,
+        sizeof(typeInfo::ProcedurePointer));
+  }
+}
+
+template <int DIM, typename = std::enable_if_t<(DIM > 0 && DIM <= maxRank)>>
+static inline RT_API_ATTRS void AssignmentForArray(Descriptor &to,
+    const Descriptor &from, const typeInfo::DerivedType *updatedToDerived,
+    const std::size_t toElementBytes, Terminator &terminator, int flags,
+    MemmoveFct memmoveFct, std::size_t toAt = 0, std::size_t fromAt = 0) {
+  for (SubscriptValue j{0}; j < to.GetDimension(DIM - 1).Extent(); ++j) {
+    if constexpr (DIM > 1)
+      AssignmentForArray<DIM - 1>(to, from, updatedToDerived, toElementBytes,
+          terminator, flags, memmoveFct, toAt, fromAt);
+    else if (updatedToDerived) {
+      ComponentsAssignment(to, from, toAt, fromAt, updatedToDerived, terminator,
+          flags, memmoveFct);
+    } else {
+      memmoveFct(to.OffsetElement<char>(toAt),
+          from.OffsetElement<const char>(fromAt), toElementBytes);
+    }
+
+    toAt += to.GetDimension(DIM - 1).ByteStride();
+    fromAt += from.GetDimension(DIM - 1).ByteStride();
+  }
+}
+
 // Common implementation of assignments, both intrinsic assignments and
 // those cases of polymorphic user-defined ASSIGNMENT(=) TBPs that could not
 // be resolved in semantics.  Most assignment statements do not need any
@@ -292,7 +402,39 @@ RT_API_ATTRS void Assign(Descriptor &to, const Descriptor &from,
           RTNAME(AssignTemporary)
           (newFrom, from, terminator.sourceFileName(), terminator.sourceLine());
         } else {
-          ShallowCopy(newFrom, from, true, from.IsContiguous());
+          if (from.IsContiguous() || from.rank() == 0) {
+            std::memcpy(newFrom.OffsetElement(), from.OffsetElement(),
+                from.Elements() * from.ElementBytes());
+          } else if (from.rank() > 6) {
+            ShallowCopy(newFrom, from, true, false);
+          } else {
+            switch (from.rank()) {
+            case 1:
+              AssignmentForArray<1>(newFrom, from, nullptr, from.ElementBytes(),
+                  terminator, flags, std::memcpy);
+              break;
+            case 2:
+              AssignmentForArray<2>(newFrom, from, nullptr, from.ElementBytes(),
+                  terminator, flags, std::memcpy);
+              break;
+            case 3:
+              AssignmentForArray<3>(newFrom, from, nullptr, from.ElementBytes(),
+                  terminator, flags, std::memcpy);
+              break;
+            case 4:
+              AssignmentForArray<4>(newFrom, from, nullptr, from.ElementBytes(),
+                  terminator, flags, std::memcpy);
+              break;
+            case 5:
+              AssignmentForArray<5>(newFrom, from, nullptr, from.ElementBytes(),
+                  terminator, flags, std::memcpy);
+              break;
+            case 6:
+              AssignmentForArray<6>(newFrom, from, nullptr, from.ElementBytes(),
+                  terminator, flags, std::memcpy);
+              break;
+            }
+          }
         }
         Assign(to, newFrom, terminator,
             flags &
@@ -381,91 +523,40 @@ RT_API_ATTRS void Assign(Descriptor &to, const Descriptor &from,
     } else if (updatedToDerived && !updatedToDerived->noDestructionNeeded()) {
       Destroy(to, /*finalize=*/false, *updatedToDerived, &terminator);
     }
-    // Copy the data components (incl. the parent) first.
-    const Descriptor &componentDesc{updatedToDerived->component()};
-    std::size_t numComponents{componentDesc.Elements()};
-    for (std::size_t j{0}; j < toElements;
-         ++j, to.IncrementSubscripts(toAt), from.IncrementSubscripts(fromAt)) {
-      for (std::size_t k{0}; k < numComponents; ++k) {
-        const auto &comp{
-            *componentDesc.ZeroBasedIndexedElement<typeInfo::Component>(
-                k)}; // TODO: exploit contiguity here
-        // Use PolymorphicLHS for components so that the right things happen
-        // when the components are polymorphic; when they're not, they're both
-        // not, and their declared types will match.
-        int nestedFlags{MaybeReallocate | PolymorphicLHS};
-        if (flags & ComponentCanBeDefinedAssignment) {
-          nestedFlags |=
-              CanBeDefinedAssignment | ComponentCanBeDefinedAssignment;
-        }
-        switch (comp.genre()) {
-        case typeInfo::Component::Genre::Data:
-          if (comp.category() == TypeCategory::Derived) {
-            StaticDescriptor<maxRank, true, 10 /*?*/> statDesc[2];
-            Descriptor &toCompDesc{statDesc[0].descriptor()};
-            Descriptor &fromCompDesc{statDesc[1].descriptor()};
-            comp.CreatePointerDescriptor(toCompDesc, to, terminator, toAt);
-            comp.CreatePointerDescriptor(
-                fromCompDesc, from, terminator, fromAt);
-            Assign(toCompDesc, fromCompDesc, terminator, nestedFlags);
-          } else { // Component has intrinsic type; simply copy raw bytes
-            std::size_t componentByteSize{comp.SizeInBytes(to)};
-            memmoveFct(to.Element<char>(toAt) + comp.offset(),
-                from.Element<const char>(fromAt) + comp.offset(),
-                componentByteSize);
-          }
-          break;
-        case typeInfo::Component::Genre::Pointer: {
-          std::size_t componentByteSize{comp.SizeInBytes(to)};
-          memmoveFct(to.Element<char>(toAt) + comp.offset(),
-              from.Element<const char>(fromAt) + comp.offset(),
-              componentByteSize);
-        } break;
-        case typeInfo::Component::Genre::Allocatable:
-        case typeInfo::Component::Genre::Automatic: {
-          auto *toDesc{reinterpret_cast<Descriptor *>(
-              to.Element<char>(toAt) + comp.offset())};
-          const auto *fromDesc{reinterpret_cast<const Descriptor *>(
-              from.Element<char>(fromAt) + comp.offset())};
-          // Allocatable components of the LHS are unconditionally
-          // deallocated before assignment (F'2018 10.2.1.3(13)(1)),
-          // unlike a "top-level" assignment to a variable, where
-          // deallocation is optional.
-          //
-          // Be careful not to destroy/reallocate the LHS, if there is
-          // overlap between LHS and RHS (it seems that partial overlap
-          // is not possible, though).
-          // Invoke Assign() recursively to deal with potential aliasing.
-          if (toDesc->IsAllocatable()) {
-            if (!fromDesc->IsAllocated()) {
-              // No aliasing.
-              //
-              // If to is not allocated, the Destroy() call is a no-op.
-              // This is just a shortcut, because the recursive Assign()
-              // below would initiate the destruction for to.
-              // No finalization is required.
-              toDesc->Destroy(
-                  /*finalize=*/false, /*destroyPointers=*/false, &terminator);
-              continue; // F'2018 10.2.1.3(13)(2)
-            }
-          }
-          // Force LHS deallocation with DeallocateLHS flag.
-          // The actual deallocation may be avoided, if the existing
-          // location can be reoccupied.
-          Assign(*toDesc, *fromDesc, terminator, nestedFlags | DeallocateLHS);
-        } break;
-        }
+
+    if (to.IsSameShapeAs(from) && to.rank() > 0 && to.rank() <= 6) {
+      switch (to.rank()) {
+      case 1:
+        AssignmentForArray<1>(to, from, updatedToDerived, toElementBytes,
+            terminator, flags, memmoveFct);
+        break;
+      case 2:
+        AssignmentForArray<2>(to, from, updatedToDerived, toElementBytes,
+            terminator, flags, memmoveFct);
+        break;
+      case 3:
+        AssignmentForArray<3>(to, from, updatedToDerived, toElementBytes,
+            terminator, flags, memmoveFct);
+        break;
+      case 4:
+        AssignmentForArray<4>(to, from, updatedToDerived, toElementBytes,
+            terminator, flags, memmoveFct);
+        break;
+      case 5:
+        AssignmentForArray<5>(to, from, updatedToDerived, toElementBytes,
+            terminator, flags, memmoveFct);
+        break;
+      case 6:
+        AssignmentForArray<6>(to, from, updatedToDerived, toElementBytes,
+            terminator, flags, memmoveFct);
+        break;
       }
-      // Copy procedure pointer components
-      const Descriptor &procPtrDesc{updatedToDerived->procPtr()};
-      std::size_t numProcPtrs{procPtrDesc.Elements()};
-      for (std::size_t k{0}; k < numProcPtrs; ++k) {
-        const auto &procPtr{
-            *procPtrDesc.ZeroBasedIndexedElement<typeInfo::ProcPtrComponent>(
-                k)};
-        memmoveFct(to.Element<char>(toAt) + procPtr.offset,
-            from.Element<const char>(fromAt) + procPtr.offset,
-            sizeof(typeInfo::ProcedurePointer));
+    } else {
+      for (std::size_t j{0}; j < toElements; ++j, to.IncrementSubscripts(toAt),
+           from.IncrementSubscripts(fromAt)) {
+        ComponentsAssignment(to, from, to.SubscriptsToByteOffset(toAt),
+            from.SubscriptsToByteOffset(fromAt), updatedToDerived, terminator,
+            flags, memmoveFct);
       }
     }
   } else { // intrinsic type, intrinsic assignment
@@ -492,10 +583,39 @@ RT_API_ATTRS void Assign(Descriptor &to, const Descriptor &from,
             to.type().raw());
       }
     } else { // elemental copies, possibly with character truncation
-      for (std::size_t n{toElements}; n-- > 0;
-           to.IncrementSubscripts(toAt), from.IncrementSubscripts(fromAt)) {
-        memmoveFct(to.Element<char>(toAt), from.Element<const char>(fromAt),
-            toElementBytes);
+      if (to.IsSameShapeAs(from) && to.rank() <= 6) { // the limit is tentative
+        switch (to.rank()) {
+        case 1:
+          AssignmentForArray<1>(
+              to, from, nullptr, toElementBytes, terminator, flags, memmoveFct);
+          break;
+        case 2:
+          AssignmentForArray<2>(
+              to, from, nullptr, toElementBytes, terminator, flags, memmoveFct);
+          break;
+        case 3:
+          AssignmentForArray<3>(
+              to, from, nullptr, toElementBytes, terminator, flags, memmoveFct);
+          break;
+        case 4:
+          AssignmentForArray<4>(
+              to, from, nullptr, toElementBytes, terminator, flags, memmoveFct);
+          break;
+        case 5:
+          AssignmentForArray<5>(
+              to, from, nullptr, toElementBytes, terminator, flags, memmoveFct);
+          break;
+        case 6:
+          AssignmentForArray<6>(
+              to, from, nullptr, toElementBytes, terminator, flags, memmoveFct);
+          break;
+        }
+      } else {
+        for (std::size_t n{toElements}; n-- > 0;
+             to.IncrementSubscripts(toAt), from.IncrementSubscripts(fromAt)) {
+          memmoveFct(to.Element<char>(toAt), from.Element<const char>(fromAt),
+              toElementBytes);
+        }
       }
     }
   }
