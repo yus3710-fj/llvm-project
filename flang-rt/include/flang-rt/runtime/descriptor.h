@@ -259,9 +259,9 @@ public:
 
   template <typename A>
   RT_API_ATTRS A *ZeroBasedIndexedElement(std::size_t n) const {
-    SubscriptValue at[maxRank];
-    if (SubscriptsForZeroBasedElementNumber(at, n)) {
-      return Element<A>(at);
+    std::size_t offset{0};
+    if (OffsetsForZeroBasedElementNumber(offset, n)) {
+      return OffsetElement<A>(offset);
     }
     return nullptr;
   }
@@ -327,6 +327,36 @@ public:
       elementNumber -= quotient * dimCoefficient[j];
     }
     subscript[k0] = elementNumber + GetDimension(k0).LowerBound();
+    return true;
+  }
+
+  // False when out of range.
+  RT_API_ATTRS bool OffsetsForZeroBasedElementNumber(std::size_t &offset,
+      std::size_t elementNumber, const int *permutation = nullptr) const {
+    if (raw_.rank == 0) {
+      return elementNumber == 0;
+    }
+    SubscriptValue dimOffset[maxRank];
+    std::size_t quotient{elementNumber}, dimCoefficient{1};
+    int k0{permutation ? permutation[0] : 0};
+    const Dimension &dim0{GetDimension(k0)};
+    dimOffset[0] = quotient % dim0.Extent();
+    offset = dimOffset[0] * dim0.ByteStride();
+    auto coefficient{static_cast<std::size_t>(dim0.Extent())};
+    for (int j{1}; j < raw_.rank; ++j) {
+      int k{permutation ? permutation[j] : j};
+      const Dimension &dim{GetDimension(k)};
+      quotient = elementNumber / coefficient;
+      dimOffset[j] = quotient % dim.Extent();
+      offset += dimOffset[j] * dim.ByteStride();
+      elementNumber -= dimOffset[j - 1] * dimCoefficient;
+      dimCoefficient = coefficient;
+      coefficient *= dim.Extent();
+    }
+    k0 = permutation ? permutation[raw_.rank - 1] : raw_.rank - 1;
+    if (quotient >= static_cast<std::size_t>(GetDimension(k0).Extent())) {
+      return false; // out of range
+    }
     return true;
   }
 
@@ -412,6 +442,16 @@ public:
   RT_API_ATTRS void ApplyMold(const Descriptor &, int rank);
 
   RT_API_ATTRS void Check() const;
+
+  RT_API_ATTRS bool IsSameShapeAs(const Descriptor &rhs) const {
+    if (raw_.rank != rhs.rank())
+      return false;
+    for (int j{0}; j < raw_.rank; ++j) {
+      if (GetDimension(j).Extent() != rhs.GetDimension(j).Extent())
+        return false;
+    }
+    return true;
+  }
 
   void Dump(FILE * = stdout) const;
 
