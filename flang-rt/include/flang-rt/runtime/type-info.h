@@ -135,15 +135,16 @@ class SpecialBinding {
 public:
   enum class Which : std::uint8_t {
     None = 0,
-    ScalarAssignment = 1,
-    ElementalAssignment = 2,
-    ReadFormatted = 3,
-    ReadUnformatted = 4,
-    WriteFormatted = 5,
-    WriteUnformatted = 6,
-    ElementalFinal = 7,
-    AssumedRankFinal = 8,
-    ScalarFinal = 9,
+    Copy = 1,
+    ScalarAssignment = 2,
+    ElementalAssignment = 3,
+    ReadFormatted = 4,
+    ReadUnformatted = 5,
+    WriteFormatted = 6,
+    WriteUnformatted = 7,
+    ElementalFinal = 8,
+    AssumedRankFinal = 9,
+    ScalarFinal = 10,
     // higher-ranked final procedures follow
   };
 
@@ -246,6 +247,7 @@ public:
   RT_API_ATTRS bool noFinalizationNeeded() const {
     return noFinalizationNeeded_;
   }
+  RT_API_ATTRS bool isSequence() const { return isSequence_; }
 
   RT_API_ATTRS std::size_t LenParameters() const {
     return lenParameterKind().Elements();
@@ -267,9 +269,9 @@ public:
       // number of special bindings that are present with smaller "which"
       // code values.
       int offset{common::BitPopulationCount(specialBitSet_ & (bit - 1))};
+      const auto &desc{special_.descriptor()};
       const auto *binding{
-          special_.descriptor().ZeroBasedIndexedElement<SpecialBinding>(
-              offset)};
+          desc.OffsetElement<SpecialBinding>(offset * desc.ElementBytes())};
       INTERNAL_CHECK(binding && binding->which() == which);
       return binding;
     } else {
@@ -328,6 +330,7 @@ private:
   bool noInitializationNeeded_{false};
   bool noDestructionNeeded_{false};
   bool noFinalizationNeeded_{false};
+  bool isSequence_{false};
 };
 
 } // namespace Fortran::runtime::typeInfo

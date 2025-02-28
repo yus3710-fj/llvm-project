@@ -631,11 +631,12 @@ private:
 // A GenericKind is one of: generic name, defined operator,
 // defined assignment, intrinsic operator, or defined I/O.
 struct GenericKind {
-  ENUM_CLASS(OtherKind, Name, DefinedOp, Assignment, Concat)
+  ENUM_CLASS(OtherKind, Name, DefinedOp, Assignment, Concat, Copy)
   GenericKind() : u{OtherKind::Name} {}
   template <typename T> GenericKind(const T &x) { u = x; }
   bool IsName() const { return Is(OtherKind::Name); }
   bool IsAssignment() const { return Is(OtherKind::Assignment); }
+  bool IsCopy() const { return Is(OtherKind::Copy); }
   bool IsDefinedOperator() const { return Is(OtherKind::DefinedOp); }
   bool IsIntrinsicOperator() const;
   bool IsOperator() const;

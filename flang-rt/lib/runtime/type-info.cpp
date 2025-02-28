@@ -291,6 +291,9 @@ FILE *SpecialBinding::Dump(FILE *f) const {
   std::fprintf(
       f, "SpecialBinding @ %p:\n", reinterpret_cast<const void *>(this));
   switch (which_) {
+  case Which::Copy:
+    std::fputs("    Copy", f);
+    break;
   case Which::ScalarAssignment:
     std::fputs("    ScalarAssignment", f);
     break;

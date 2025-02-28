@@ -274,7 +274,53 @@ private:
   void createTypeInfoOpAndGlobal(Fortran::lower::AbstractConverter &converter,
                                  const TypeInfo &info) {
     Fortran::lower::createRuntimeTypeInfoGlobal(converter, info.symbol.get());
+    materializeCopyRoutine(converter, info);
     createTypeInfoOp(converter, info);
+  }
+
+  [[maybe_unused]] void
+  materializeCopyRoutine(Fortran::lower::AbstractConverter &converter,
+                         const TypeInfo &info) {
+    if (info.symbol->IsFromModFile())
+      return; // avoid multiple definition
+
+    mlir::Location loc = converter.genUnknownLocation();
+    fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+    mlir::OpBuilder::InsertPoint backupPoint = builder.saveInsertionPoint();
+    const Fortran::semantics::Scope &derivedScope =
+        DEREF(info.typeSpec.GetScope());
+
+    for (auto pair : derivedScope) {
+      const Fortran::semantics::Symbol &symbol{*pair.second};
+      if (const auto *generic{
+              symbol.detailsIf<Fortran::semantics::GenericDetails>()}) {
+        if (generic->kind().IsCopy()) {
+          const auto &spec = generic->specificProcs();
+          const Fortran::semantics::Symbol &bindingSymbol{
+              (*spec.begin()).get()};
+          const auto *cpyProc{
+              bindingSymbol
+                  .detailsIf<Fortran::semantics::ProcBindingDetails>()};
+          assert(cpyProc && "No copy routine for the derived type");
+          const Fortran::semantics::Symbol &cpySymbol{cpyProc->symbol()};
+
+          std::string CpyName = converter.mangleName(cpySymbol);
+          mlir::func::FuncOp copy = builder.getNamedFunction(
+              converter.getModuleOp(), converter.getMLIRSymbolTable(), CpyName);
+          copy.addEntryBlock();
+          builder.setInsertionPointToEnd(&copy.front());
+          assert(copy.getNumArguments() == 2 &&
+                 "Number of arguments of copy routine is not 2.");
+
+          auto &region = copy.getOperation()->getRegion(0);
+          hlfir::Entity lhs{region.getArgument(0)}, rhs{region.getArgument(1)};
+          builder.create<hlfir::AssignOp>(loc, rhs, lhs);
+          builder.create<mlir::func::ReturnOp>(loc, mlir::ValueRange{});
+        }
+      }
+    }
+
+    builder.restoreInsertionPoint(backupPoint);
   }
 
   void createTypeInfoOp(Fortran::lower::AbstractConverter &converter,
