@@ -15,6 +15,7 @@
 #include "flang/Optimizer/Support/InternalNames.h"
 #include "flang/Semantics/scope.h"
 #include "flang/Semantics/tools.h"
+#include "llvm/Support/Debug.h" // FIXME: remove this after implementation
 #include <functional>
 #include <list>
 #include <map>
@@ -33,6 +34,7 @@
 //   .p.TYPE       - TYPE(ProcPtrComponent) descriptions for TYPE
 //   .s.TYPE       - TYPE(SpecialBinding) bindings for TYPE
 //   .v.TYPE       - TYPE(Binding) bindings for TYPE
+//   .cpy.TYPE     - Copy routines for TYPE
 
 namespace Fortran::semantics {
 
@@ -148,6 +150,7 @@ private:
   SomeExpr deferredEnum_; // Value::Genre::Deferred
   SomeExpr explicitEnum_; // Value::Genre::Explicit
   SomeExpr lenParameterEnum_; // Value::Genre::LenParameter
+  SomeExpr copyEnum_; // SpecialBinding::Which::Copy
   SomeExpr scalarAssignmentEnum_; // SpecialBinding::Which::ScalarAssignment
   SomeExpr
       elementalAssignmentEnum_; // SpecialBinding::Which::ElementalAssignment
@@ -173,6 +176,7 @@ RuntimeTableBuilder::RuntimeTableBuilder(
       deferredEnum_{GetEnumValue("deferred")},
       explicitEnum_{GetEnumValue("explicit")},
       lenParameterEnum_{GetEnumValue("lenparameter")},
+      copyEnum_{GetEnumValue("copy")},
       scalarAssignmentEnum_{GetEnumValue("scalarassignment")},
       elementalAssignmentEnum_{GetEnumValue("elementalassignment")},
       readFormattedEnum_{GetEnumValue("readformatted")},
@@ -395,6 +399,61 @@ static std::optional<std::string> GetSuffixIfTypeKindParameters(
   return std::nullopt;
 }
 
+static void CreateCopyRoutine(SemanticsContext &context, Scope &scope,
+    Scope &dtScope, const Symbol *dtSymbol,
+    const DerivedTypeSpec *derivedTypeSpec, SourceName procName) {
+  if (dtSymbol->get<DerivedTypeDetails>().sequence())
+    return; // sequence type does not have type-bound procedures
+
+  Attrs attrs{};
+  if (FindModuleContaining(dtScope) == &scope)
+    attrs |= Attrs{Attr::PUBLIC};
+  else
+    attrs |= Attrs{Attr::EXTERNAL};
+  Symbol &sym{*scope.try_emplace(procName, attrs).first->second};
+  Scope &subpScope{scope.MakeScope(Scope::Kind::Subprogram, &sym)};
+  sym.set(Symbol::Flag::CompilerCreated);
+  sym.set(Symbol::Flag::Subroutine);
+
+  HostAssocDetails copyAssoc{sym};
+  Symbol &assocSym{
+      *subpScope.try_emplace(sym.name(), std::move(copyAssoc)).first->second};
+  assocSym.set(Symbol::Flag::Subroutine);
+
+  ObjectEntityDetails lhs, rhs;
+  DeclTypeSpec &type{dtScope.MakeDerivedType(
+      DeclTypeSpec::TypeDerived, common::Clone(*derivedTypeSpec))};
+  lhs.set_type(type);
+  rhs.set_type(type);
+  lhs.set_isDummy();
+  rhs.set_isDummy();
+  SourceName lhsName{"lhs", 3}, rhsName{"rhs", 3};
+  Symbol &lhsSym{*subpScope.try_emplace(lhsName, std::move(lhs)).first->second};
+  Symbol &rhsSym{*subpScope.try_emplace(rhsName, std::move(rhs)).first->second};
+
+  SubprogramDetails copy;
+  copy.add_dummyArg(lhsSym);
+  copy.add_dummyArg(rhsSym);
+  if (sym.attrs().test(Attr::EXTERNAL))
+    copy.set_isInterface();
+  sym.set_details(std::move(copy));
+
+  ProcBindingDetails copyBind{sym};
+  Symbol &bindsym{*dtScope
+                       .try_emplace(context.GetTempName(dtScope),
+                           Attrs{Attr::NOPASS}, std::move(copyBind))
+                       .first->second};
+  bindsym.set(Symbol::Flag::CompilerCreated);
+
+  GenericDetails special{};
+  special.set_kind(GenericKind(GenericKind::OtherKind::Copy));
+  SourceName genName{context.GetTempName(dtScope)};
+  special.AddSpecificProc(bindsym, genName);
+  Symbol &spsym{
+      *dtScope.try_emplace(genName, Attrs{}, std::move(special)).first->second};
+  spsym.set(Symbol::Flag::CompilerCreated);
+}
+
 const Symbol *RuntimeTableBuilder::DescribeType(Scope &dtScope) {
   if (const Symbol * info{dtScope.runtimeDerivedTypeDescription()}) {
     return info;
@@ -592,6 +651,8 @@ const Symbol *RuntimeTableBuilder::DescribeType(Scope &dtScope) {
     // Compile the "vtable" of type-bound procedure bindings
     std::uint32_t specialBitSet{0};
     if (!dtSymbol->attrs().test(Attr::ABSTRACT)) {
+      CreateCopyRoutine(context_, scope, dtScope, dtSymbol, derivedTypeSpec,
+          SaveObjectName((fir::kCopyProcSeparator + distinctName).str()));
       std::vector<evaluate::StructureConstructor> bindings{
           DescribeBindings(dtScope, scope)};
       AddValue(dtValues, derivedTypeSchema_, bindingDescCompName,
@@ -1077,6 +1138,12 @@ void RuntimeTableBuilder::DescribeSpecialGeneric(const GenericDetails &generic,
                     /*isFinal=*/false, std::nullopt, &dtScope, derivedTypeSpec,
                     /*isTypeBound=*/true);
               }
+            } else if (k == GenericKind::OtherKind::Copy) {
+              for (auto ref : generic.specificProcs()) {
+                DescribeSpecialProc(specials, *ref, /*isAssignment=*/false,
+                    /*isFinal=*/false, std::nullopt, &dtScope, derivedTypeSpec,
+                    /*isTypeBound=*/true);
+              }
             }
           },
           [&](const common::DefinedIo &io) {
@@ -1176,7 +1243,7 @@ void RuntimeTableBuilder::DescribeSpecialProc(
           }
         }
       }
-    } else { // defined derived type I/O
+    } else if (io.has_value()) { // defined derived type I/O
       CHECK(proc->dummyArguments.size() >= 4);
       const auto *ddo{std::get_if<evaluate::characteristics::DummyDataObject>(
           &proc->dummyArguments[0].u)};
@@ -1206,6 +1273,9 @@ void RuntimeTableBuilder::DescribeSpecialProc(
         which = writeUnformattedEnum_;
         break;
       }
+    } else { // copy routine generated by the compiler
+      CHECK(proc->dummyArguments.size() == 2);
+      which = copyEnum_;
     }
     if (argThatMightBeDescriptor != 0) {
       if (const auto *dummyData{
@@ -1460,6 +1530,74 @@ bool ShouldIgnoreRuntimeTypeInfoNonTbpGenericInterfaces(
           },
       },
       symbol->GetUltimate().details());
+}
+
+// FIXME: remove this after implementation
+static void PutIndent(llvm::raw_ostream &os, int indent) {
+  for (int i = 0; i < indent; ++i) {
+    os << "  ";
+  }
+}
+static void dumpScope(const Scope &scope, int indent = 0) {
+  PutIndent(llvm::dbgs(), indent);
+  llvm::dbgs() << Scope::EnumToString(scope.kind()) << " scope:";
+  if (const auto *symbol{scope.symbol()}) {
+    llvm::dbgs() << ' ' << symbol->name();
+  }
+  if (scope.alignment().has_value()) {
+    llvm::dbgs() << " size=" << scope.size()
+                 << " alignment=" << *scope.alignment();
+  }
+  if (scope.derivedTypeSpec()) {
+    llvm::dbgs() << " instantiation of " << *scope.derivedTypeSpec();
+  }
+  llvm::dbgs() << " sourceRange=" << scope.sourceRange().size() << " bytes\n";
+  ++indent;
+  for (const auto &pair : scope) {
+    const auto &symbol{*pair.second};
+    PutIndent(llvm::dbgs(), indent);
+    llvm::dbgs() << symbol << '\n';
+    if (const auto *details{symbol.detailsIf<GenericDetails>()}) {
+      if (const auto &type{details->derivedType()}) {
+        PutIndent(llvm::dbgs(), indent);
+        llvm::dbgs() << *type << '\n';
+      }
+    }
+  }
+  if (!scope.equivalenceSets().empty()) {
+    PutIndent(llvm::dbgs(), indent);
+    llvm::dbgs() << "Equivalence Sets:";
+    for (const auto &set : scope.equivalenceSets()) {
+      llvm::dbgs() << ' ';
+      char sep = '(';
+      for (const auto &object : set) {
+        llvm::dbgs() << sep << object.AsFortran();
+        sep = ',';
+      }
+      llvm::dbgs() << ')';
+    }
+    llvm::dbgs() << '\n';
+  }
+  if (!scope.crayPointers().empty()) {
+    PutIndent(llvm::dbgs(), indent);
+    llvm::dbgs() << "Cray Pointers:";
+    for (const auto &[pointee, pointer] : scope.crayPointers()) {
+      llvm::dbgs() << " (" << pointer->name() << ',' << pointee << ')';
+    }
+  }
+  for (const auto &pair : scope.commonBlocks()) {
+    const auto &symbol{*pair.second};
+    PutIndent(llvm::dbgs(), indent);
+    llvm::dbgs() << symbol << '\n';
+  }
+  for (const auto &child : scope.children()) {
+    dumpScope(child, indent);
+  }
+  --indent;
+}
+void printSymTable(SemanticsContext &context) {
+  // context.DumpSymbols(llvm::dbgs());
+  dumpScope(context.globalScope());
 }
 
 } // namespace Fortran::semantics

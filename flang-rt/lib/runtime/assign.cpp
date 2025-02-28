@@ -328,20 +328,35 @@ static inline RT_API_ATTRS void AssignmentForArray(Descriptor &to,
     const Descriptor &from, const typeInfo::DerivedType *updatedToDerived,
     const std::size_t toElementBytes, Terminator &terminator, int flags,
     MemmoveFct memmoveFct, std::size_t toAt = 0, std::size_t fromAt = 0) {
+  using CopyFct = void *(*)(void *, const void *);
+  const typeInfo::SpecialBinding *special{updatedToDerived
+          ? updatedToDerived->FindSpecialBinding(
+                typeInfo::SpecialBinding::Which::Copy)
+          : nullptr};
+
   for (SubscriptValue j{0}; j < to.GetDimension(DIM - 1).Extent(); ++j) {
     if constexpr (DIM > 1)
       AssignmentForArray<DIM - 1>(to, from, updatedToDerived, toElementBytes,
           terminator, flags, memmoveFct, toAt, fromAt);
     else if (updatedToDerived) {
-      // TODO: make CreatePointerDescriptor() receive std::size_t instead of
-      // SubscriptValue[]
-      SubscriptValue toSub[maxRank], fromSub[maxRank];
-      if (to.SubscriptsForZeroBasedElementNumber(toSub, toAt) &&
-          from.SubscriptsForZeroBasedElementNumber(fromSub, fromAt))
-        ComponentsAssignment(to, from, toSub, fromSub, updatedToDerived,
-            terminator, flags, memmoveFct);
-      else
-        terminator.Crash("detected an out of range access");
+      if (special) { // copy routine
+        auto *copyFct{special->GetProc<CopyFct>()};
+        copyFct(to.OffsetElement<char>(toAt),
+            from.OffsetElement<const char>(fromAt));
+      } else if (updatedToDerived->isSequence()) { // sequence type
+        memmoveFct(to.OffsetElement<char>(toAt),
+            from.OffsetElement<const char>(fromAt), toElementBytes);
+      } else {
+        // TODO: make CreatePointerDescriptor() receive std::size_t instead of
+        // SubscriptValue[]
+        SubscriptValue toSub[maxRank], fromSub[maxRank];
+        if (to.SubscriptsForZeroBasedElementNumber(toSub, toAt) &&
+            from.SubscriptsForZeroBasedElementNumber(fromSub, fromAt))
+          ComponentsAssignment(to, from, toSub, fromSub, updatedToDerived,
+              terminator, flags, memmoveFct);
+        else
+          terminator.Crash("detected an out of range access");
+      }
     } else {
       memmoveFct(to.OffsetElement<char>(toAt),
           from.OffsetElement<const char>(fromAt), toElementBytes);

@@ -106,11 +106,12 @@ module __fortran_type_info
   end type
 
   enum, bind(c) ! SpecialBinding::Which
-    enumerator :: ScalarAssignment = 1, ElementalAssignment = 2
-    enumerator :: ReadFormatted = 3, ReadUnformatted = 4
-    enumerator :: WriteFormatted = 5, WriteUnformatted = 6
-    enumerator :: ElementalFinal = 7, AssumedRankFinal = 8
-    enumerator :: ScalarFinal = 9 ! higher-rank final procedures follow
+    enumerator :: Copy = 1
+    enumerator :: ScalarAssignment = 2, ElementalAssignment = 3
+    enumerator :: ReadFormatted = 4, ReadUnformatted = 5
+    enumerator :: WriteFormatted = 6, WriteUnformatted = 7
+    enumerator :: ElementalFinal = 8, AssumedRankFinal = 9
+    enumerator :: ScalarFinal = 10 ! higher-rank final procedures follow
   end enum
 
   type, bind(c) :: SpecialBinding
